@@ -77,11 +77,12 @@ module OmniAuth
         elsif verify_token(request.params['access_token'])
           ::OAuth2::AccessToken.from_hash(client, request.params.dup)
         else
-          verifier = request.params['code']
-          client.auth_code.get_token(verifier, get_token_options(callback_url), deep_symbolize(options.auth_token_params))
+          orig_build_access_token
         end
       end
-      alias build_access_token custom_build_access_token
+
+      alias_method :orig_build_access_token, :build_access_token
+      alias_method :build_access_token, :custom_build_access_token
 
       private
 
