@@ -1,4 +1,5 @@
 require 'omniauth/strategies/oauth2'
+require 'uri'
 
 module OmniAuth
   module Strategies
@@ -6,6 +7,9 @@ module OmniAuth
       BASE_SCOPE_URL = "https://www.googleapis.com/auth/"
       BASE_SCOPES = %w[profile email openid]
       DEFAULT_SCOPE = "email,profile"
+      USER_INFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo'
+      TOKEN_INFO_URL = 'https://www.googleapis.com/oauth2/v3/tokeninfo'
+
 
       option :name, 'google_oauth2'
 
@@ -14,9 +18,9 @@ module OmniAuth
       option :authorize_options, [:access_type, :hd, :login_hint, :prompt, :request_visible_actions, :scope, :state, :redirect_uri, :include_granted_scopes]
 
       option :client_options, {
-        :site          => 'https://accounts.google.com',
-        :authorize_url => '/o/oauth2/auth',
-        :token_url     => '/o/oauth2/token'
+        :site          => 'https://oauth2.googleapis.com',
+        :authorize_url => 'https://accounts.google.com/o/oauth2/auth',
+        :token_url     => '/token'
       }
 
       def authorize_params
@@ -54,33 +58,48 @@ module OmniAuth
         hash = {}
         hash[:id_token] = access_token['id_token']
         hash[:raw_info] = raw_info unless skip_info?
-        hash[:raw_friend_info] = raw_friend_info(raw_info['sub']) unless skip_info? || options[:skip_friends]
         prune! hash
       end
 
       def raw_info
-        @raw_info ||= access_token.get('https://www.googleapis.com/plus/v1/people/me/openIdConnect').parsed
-      end
-
-      def raw_friend_info(id)
-        @raw_friend_info ||= access_token.get("https://www.googleapis.com/plus/v1/people/#{id}/people/visible").parsed
+        @raw_info ||= access_token.get(USER_INFO_URL).parsed
       end
 
       def custom_build_access_token
         if request.xhr? && request.params['code']
           verifier = request.params['code']
-          client.auth_code.get_token(verifier, { :redirect_uri => 'postmessage'}.merge(token_params.to_hash(:symbolize_keys => true)),
-                                     deep_symbolize(options.auth_token_params || {}))
-        elsif verify_token(request.params['id_token'], request.params['access_token'])
+          redirect_uri = request.params['redirect_uri'] || 'postmessage'
+          client.auth_code.get_token(verifier, get_token_options(redirect_uri), deep_symbolize(options.auth_token_params || {}))
+        elsif request.params['code'] && request.params['redirect_uri']
+          verifier = request.params['code']
+          redirect_uri = request.params['redirect_uri']
+          client.auth_code.get_token(verifier, get_token_options(redirect_uri), deep_symbolize(options.auth_token_params || {}))
+        elsif verify_token(request.params['access_token'])
           ::OAuth2::AccessToken.from_hash(client, request.params.dup)
         else
-          orig_build_access_token
+          verifier = request.params['code']
+          client.auth_code.get_token(verifier, get_token_options(callback_url), deep_symbolize(options.auth_token_params))
         end
       end
-      alias_method :orig_build_access_token, :build_access_token
-      alias_method :build_access_token, :custom_build_access_token
+      alias build_access_token custom_build_access_token
 
       private
+
+      def callback_url
+        options[:redirect_uri] || (full_host + script_name + callback_path)
+      end
+
+      def get_token_options(redirect_uri)
+        { redirect_uri: redirect_uri }.merge(token_params.to_hash(symbolize_keys: true))
+      end
+
+      def verify_token(access_token)
+        return false unless access_token
+
+        raw_response = client.request(:get, TOKEN_INFO_URL,
+                                      params: { access_token: access_token }).parsed
+        raw_response['aud'] == options.client_id || options.authorized_client_ids.include?(raw_response['aud'])
+      end
 
       def prune!(hash)
         hash.delete_if do |_, v|
@@ -94,19 +113,24 @@ module OmniAuth
       end
 
       def image_url
-        original_url = raw_info['picture']
-        original_url = original_url.gsub("https:https://", "https://") if original_url
-        params_index = original_url.index('/photo.jpg') if original_url
+        return nil unless raw_info['picture']
 
-        if params_index && image_size_opts_passed?
-          original_url.insert(params_index, image_params)
-        else
-          original_url
+        u = URI.parse(raw_info['picture'].gsub('https:https', 'https'))
+
+        path_index = u.path.to_s.index('/photo.jpg')
+
+        if path_index && image_size_opts_passed?
+          u.path.insert(path_index, image_params)
+          u.path = u.path.gsub('//', '/')
         end
+
+        u.query = strip_unnecessary_query_parameters(u.query)
+
+        u.to_s
       end
 
       def image_size_opts_passed?
-        !!(options[:image_size] || options[:image_aspect_ratio])
+        options[:image_size] || options[:image_aspect_ratio]
       end
 
       def image_params
@@ -122,14 +146,18 @@ module OmniAuth
         '/' + image_params.join('-')
       end
 
-      def verify_token(id_token, access_token)
-        return false unless (id_token && access_token)
+      def strip_unnecessary_query_parameters(query_parameters)
+        # strip `sz` parameter (defaults to sz=50) which overrides `image_size` options
+        return nil if query_parameters.nil?
 
-        raw_response = client.request(:get, 'https://www.googleapis.com/oauth2/v2/tokeninfo', :params => {
-          :id_token => id_token,
-          :access_token => access_token
-        }).parsed
-        raw_response['issued_to'] == options.client_id
+        params = CGI.parse(query_parameters)
+        stripped_params = params.delete_if { |key| key == 'sz' }
+
+        # don't return an empty Hash since that would result
+        # in URLs with a trailing ? character: http://image.url?
+        return nil if stripped_params.empty?
+
+        URI.encode_www_form(stripped_params)
       end
     end
   end
